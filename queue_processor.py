@@ -6,8 +6,8 @@ from typing import Any
 
 log = logging.getLogger("facturas-bot")
 
-MAX_QUEUE_SIZE = 20
-COOLDOWN = 2.0
+MAX_QUEUE_SIZE = 100
+COOLDOWN = 1.0
 TIMEOUT = 90
 
 
@@ -25,13 +25,13 @@ class FacturaJob:
 class FacturaQueue:
     def __init__(self):
         self._queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
-        self._processing = set()
+        self._processing = False
         self._started = False
         self._stats = {"ok": 0, "err": 0}
 
     @property
     def stats(self):
-        return {**self._stats, "en_cola": self._queue.qsize(), "procesando": len(self._processing)}
+        return {**self._stats, "en_cola": self._queue.qsize(), "procesando": 1 if self._processing else 0}
 
     async def start(self):
         if self._started:
@@ -41,8 +41,6 @@ class FacturaQueue:
         log.info("Cola de facturas iniciada")
 
     async def add(self, job):
-        if job.user_id in self._processing:
-            return False, "Ya tienes una factura en proceso. Espera."
         if self._queue.full():
             return False, "Cola llena. Intenta luego."
         await self._queue.put(job)
@@ -54,7 +52,7 @@ class FacturaQueue:
     async def _worker(self):
         while True:
             job = await self._queue.get()
-            self._processing.add(job.user_id)
+            self._processing = True
             try:
                 await asyncio.wait_for(self._process(job), timeout=TIMEOUT)
                 self._stats["ok"] += 1
@@ -72,7 +70,7 @@ class FacturaQueue:
                 except Exception:
                     pass
             finally:
-                self._processing.discard(job.user_id)
+                self._processing = False
                 job.image_bytes = None
                 gc.collect()
                 self._queue.task_done()
