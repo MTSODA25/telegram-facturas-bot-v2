@@ -5,6 +5,7 @@ import re
 import time
 import base64
 import logging
+import gc
 from datetime import datetime, timezone
 from typing import Dict, Any
 
@@ -21,6 +22,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 from openai import OpenAI
+
+from queue_processor import cola, FacturaJob
 
 
 # =========================
@@ -154,7 +157,7 @@ El nombre del proveedor puede estar en:
 
 REGLAS:
 1) Prioriza el nombre cerca del RNC del emisor, encabezado y en mayúsculas. Valora SRL, S.A., S.A.S., EIRL.
-2) NO uses: nombre del cliente, “Consumidor Final”, sección “Cliente”, banco.
+2) NO uses: nombre del cliente, "Consumidor Final", sección "Cliente", banco.
 3) Si aparecen múltiples empresas: el proveedor es quien EMITE la factura (RNC asociado al comprobante).
 4) Si no es claro: Proveedor="" y explica breve en Observaciones.
 
@@ -167,7 +170,7 @@ RNC:
 
 NCF:
 - Puede iniciar con B, E u otra letra válida.
-- Debe estar asociado a “NCF” o “Comprobante Fiscal”.
+- Debe estar asociado a "NCF" o "Comprobante Fiscal".
 - Si está incompleto → "".
 
 Fecha_Factura:
@@ -185,14 +188,14 @@ ITBIS:
 - Si hay Propina legal 10%, NO mezclar con ITBIS; anotarlo.
 
 Total:
-- Priorizar “TOTAL”, “Total a pagar”, “Monto Total”, “Total General”.
+- Priorizar "TOTAL", "Total a pagar", "Monto Total", "Total General".
 - Si hay múltiples totales, elige el final a pagar y explica.
 
 Moneda:
 - RD$, DOP → DOP
 - USD, US$, Dólares → USD
 - € → EUR
-- Si solo “$” sin contexto → ""
+- Si solo "$" sin contexto → ""
 
 Método_Pago:
 - Detecta: Efectivo, Tarjeta, Crédito, Débito, Transferencia, Cheque.
@@ -331,71 +334,130 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Bot activo.\n"
         "Envíame una FOTO de una factura.\n"
-        "Flujo: ChatGPT (visión) → Google Sheets."
+        "Flujo: ChatGPT (visión) → Google Sheets.\n\n"
+        "Puedes enviar varias fotos seguidas — se procesan en orden.\n"
+        "/estado — Ver cola de procesamiento"
+    )
+
+
+async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = cola.stats
+    await update.message.reply_text(
+        f"📋 Cola de facturas\n\n"
+        f"En cola: {s['en_cola']}\n"
+        f"Procesando: {s['procesando']}\n"
+        f"Completadas: {s['ok']}\n"
+        f"Errores: {s['err']}"
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheets = get_sheets_client()
-
+    """Recibe foto y la ENCOLA (no procesa directo) para evitar OOM."""
     user = update.effective_user.username or str(update.effective_user.id)
+    status_msg = await update.message.reply_text("⏳ Recibida. Procesando...")
+
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        img_bytes = buf.getvalue()
+
+        if len(img_bytes) > MAX_IMAGE_BYTES:
+            await status_msg.edit_text("⚠️ Imagen muy pesada. Envía una más pequeña.")
+            return
+
+        job = FacturaJob(
+            user_id=update.effective_user.id,
+            username=user,
+            image_bytes=img_bytes,
+            media_type="image/jpeg",
+            update=update,
+            status_msg=status_msg,
+            context=context,
+        )
+
+        ok, msg = await cola.add(job)
+        if not ok:
+            await status_msg.edit_text(f"⚠️ {msg}")
+            return
+        if msg:
+            await status_msg.edit_text(f"📋 {msg}")
+
+    except Exception as e:
+        logger.error(f"Error recibiendo foto: {e}", exc_info=True)
+        await status_msg.edit_text(f"⚠️ Error: {e}")
+
+
+async def process_queued_invoice(job: FacturaJob):
+    """Procesa UNA factura. Llamado por el worker de la cola (1 a la vez)."""
+    user = job.username
+    img_bytes = job.image_bytes
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    photo = update.message.photo[-1]
-    tg_file = await context.bot.get_file(photo.file_id)
+    try:
+        await job.status_msg.edit_text("🧠 Analizando factura con ChatGPT (visión)…")
 
-    buf = io.BytesIO()
-    await tg_file.download_to_memory(out=buf)
-    img_bytes = buf.getvalue()
+        sheets = get_sheets_client()
+        ai = parse_invoice_from_image_with_gpt(img_bytes)
 
-    await update.message.reply_text("🧠 Analizando factura con ChatGPT (visión)…")
+        # Liberar imagen de memoria inmediatamente
+        job.image_bytes = None
+        img_bytes = None
+        gc.collect()
 
-    ai = parse_invoice_from_image_with_gpt(img_bytes)
+        estado = (ai.get("Estado") or "").strip().upper()
+        if estado not in ("OK", "REVISAR"):
+            estado = compute_estado_fallback(ai)
 
-    estado = (ai.get("Estado") or "").strip().upper()
-    if estado not in ("OK", "REVISAR"):
-        estado = compute_estado_fallback(ai)
+        sheet_id_clean = clean_sheet_id(SHEET_ID)
 
-    sheet_id_clean = clean_sheet_id(SHEET_ID)
+        row = [
+            timestamp,                                 # A Timestamp_UTC
+            user,                                      # B Telegram_User
+            ai.get("Proveedor", "") or "",             # C Proveedor
+            ai.get("RNC", "") or "",                   # D RNC
+            ai.get("NCF", "") or "",                   # E NCF
+            ai.get("Fecha_Factura", "") or "",         # F Fecha_Factura
+            ai.get("Subtotal_Gravado", "") or "",      # G Subtotal_Gravado
+            ai.get("ITBIS", "") or "",                 # H ITBIS
+            ai.get("Total", "") or "",                 # I Total
+            ai.get("Moneda", "") or "",                # J Moneda
+            ai.get("Metodo_Pago", "") or "",           # K Metodo_Pago
+            ai.get("Categoria_Gasto", "") or "",       # L Categoria_Gasto
+            ai.get("Proyecto_CentroCosto", "") or "",  # M Proyecto_CentroCosto
+            "",                                        # N Drive_File_Link (no usado)
+            "",                                        # O OCR_Text (no usado)
+            estado,                                    # P Estado
+            ai.get("Observaciones", "") or "",         # Q Observaciones
+        ]
 
-    # 17 columnas exactas según tu sheet
-    # Nota: aunque el prompt dice que algunos deben venir "", la FILA sí los llena.
-    row = [
-        timestamp,                                 # A Timestamp_UTC
-        user,                                      # B Telegram_User
-        ai.get("Proveedor", "") or "",             # C Proveedor
-        ai.get("RNC", "") or "",                   # D RNC
-        ai.get("NCF", "") or "",                   # E NCF
-        ai.get("Fecha_Factura", "") or "",         # F Fecha_Factura
-        ai.get("Subtotal_Gravado", "") or "",      # G Subtotal_Gravado
-        ai.get("ITBIS", "") or "",                 # H ITBIS
-        ai.get("Total", "") or "",                 # I Total
-        ai.get("Moneda", "") or "",                # J Moneda
-        ai.get("Metodo_Pago", "") or "",           # K Metodo_Pago
-        ai.get("Categoria_Gasto", "") or "",       # L Categoria_Gasto
-        ai.get("Proyecto_CentroCosto", "") or "",  # M Proyecto_CentroCosto
-        "",                                        # N Drive_File_Link (no usado)
-        "",                                        # O OCR_Text (no usado)
-        estado,                                    # P Estado
-        ai.get("Observaciones", "") or "",         # Q Observaciones
-    ]
+        append_to_sheet(sheets, sheet_id_clean, row)
 
-    append_to_sheet(sheets, sheet_id_clean, row)
+        await job.status_msg.edit_text(
+            "✅ Registrado en Google Sheets.\n\n"
+            f"Proveedor: {ai.get('Proveedor') or '—'}\n"
+            f"RNC: {ai.get('RNC') or '—'}\n"
+            f"NCF: {ai.get('NCF') or '—'}\n"
+            f"Fecha: {ai.get('Fecha_Factura') or '—'}\n"
+            f"Subtotal: {ai.get('Subtotal_Gravado') or '—'}\n"
+            f"ITBIS: {ai.get('ITBIS') or '—'}\n"
+            f"Total: {ai.get('Total') or '—'}\n"
+            f"Moneda: {ai.get('Moneda') or '—'}\n"
+            f"Método pago: {ai.get('Metodo_Pago') or '—'}\n"
+            f"Estado: {estado}\n"
+            f"Obs: {ai.get('Observaciones') or '—'}"
+        )
 
-    await update.message.reply_text(
-        "✅ Registrado en Google Sheets.\n\n"
-        f"Proveedor: {ai.get('Proveedor') or '—'}\n"
-        f"RNC: {ai.get('RNC') or '—'}\n"
-        f"NCF: {ai.get('NCF') or '—'}\n"
-        f"Fecha: {ai.get('Fecha_Factura') or '—'}\n"
-        f"Subtotal: {ai.get('Subtotal_Gravado') or '—'}\n"
-        f"ITBIS: {ai.get('ITBIS') or '—'}\n"
-        f"Total: {ai.get('Total') or '—'}\n"
-        f"Moneda: {ai.get('Moneda') or '—'}\n"
-        f"Método pago: {ai.get('Metodo_Pago') or '—'}\n"
-        f"Estado: {estado}\n"
-        f"Obs: {ai.get('Observaciones') or '—'}"
-    )
+    except Exception as e:
+        logger.error(f"Error procesando factura: {e}", exc_info=True)
+        await job.status_msg.edit_text(
+            f"⚠️ Error procesando la factura: {e}\n"
+            "Reintenta enviando la foto."
+        )
+    finally:
+        gc.collect()
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -410,9 +472,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def post_init(app: Application):
+    """Arranca el worker de la cola cuando el bot inicia."""
+    await cola.start()
+    logger.info("Cola de facturas iniciada")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_error_handler(on_error)
 
